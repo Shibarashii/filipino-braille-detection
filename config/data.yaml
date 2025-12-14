@@ -1,3 +1,5 @@
+# config/data.yaml
+
 path: data/grade1_dataset_updated
 train: train/images
 val: valid/images

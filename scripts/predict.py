@@ -1,17 +1,19 @@
 """
-Prediction Script for Nail Feature Object Detection
-Supports: images, videos, directories, and webcam/camera
+Robust Braille Prediction Script with Error Correction
+Includes spell checking, gap detection, and intelligent corrections
 """
-from utils.logger import get_logger
-from config.model_config import ModelConfig
+from scripts.braille_converter import RobustBrailleConverter
+import numpy as np
+import time
+import yaml
+import cv2
+from datetime import datetime
+import argparse
 from models.yolo_detector import YOLODetector
+from config.model_config import ModelConfig
+from utils.logger import get_logger
 import sys
 from pathlib import Path
-import argparse
-from datetime import datetime
-import cv2
-import yaml
-import time
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -21,7 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Predict with YOLO Object Detection Model")
+        description="Robust Braille Prediction with Error Correction")
 
     parser.add_argument("--weights", type=str, required=True,
                         help="Path to trained model weights")
@@ -73,6 +75,44 @@ def parse_args():
     parser.add_argument("--show-fps", action="store_true",
                         default=True, help="Show FPS")
 
+    # Robust conversion parameters
+    parser.add_argument("--line-height", type=int, default=50,
+                        help="Max vertical distance for same line (pixels)")
+    parser.add_argument("--word-gap", type=int, default=30,
+                        help="Min horizontal distance for word spacing (pixels)")
+    parser.add_argument("--char-gap", type=int, default=25,
+                        help="Expected spacing between characters (pixels)")
+    parser.add_argument("--min-confidence", type=float, default=0.15,
+                        help="Minimum confidence to trust detection")
+    parser.add_argument("--enable-spellcheck", action="store_true", default=True,
+                        help="Enable spell checking corrections")
+    parser.add_argument("--disable-spellcheck", dest="enable_spellcheck",
+                        action="store_false")
+    parser.add_argument("--enable-gap-detection", action="store_true", default=True,
+                        help="Detect potential missing characters")
+    parser.add_argument("--disable-gap-detection", dest="enable_gap_detection",
+                        action="store_false")
+    parser.add_argument("--show-text", action="store_true", default=True,
+                        help="Display converted text on image")
+    parser.add_argument("--save-text-file", action="store_true", default=True,
+                        help="Save converted text to file")
+    parser.add_argument("--save-report", action="store_true", default=True,
+                        help="Save detailed correction report")
+    parser.add_argument("--language", type=str, default='en',
+                        help="Language for spell checking (en, es, etc.)")
+
+    # Image standardization parameters
+    parser.add_argument("--standardize-size", action="store_true", default=True,
+                        help="Resize all images to standard resolution")
+    parser.add_argument("--output-width", type=int, default=1920,
+                        help="Standard output width (if --standardize-size enabled)")
+    parser.add_argument("--output-height", type=int, default=1080,
+                        help="Standard output height (if --standardize-size enabled)")
+    parser.add_argument("--keep-aspect-ratio", action="store_true", default=True,
+                        help="Maintain aspect ratio when resizing")
+    parser.add_argument("--no-keep-aspect-ratio", dest="keep_aspect_ratio",
+                        action="store_false")
+
     return parser.parse_args()
 
 
@@ -85,14 +125,137 @@ def is_camera_source(source):
         return False
 
 
-def predict_camera(detector, camera_idx, args, class_names):
-    """Handle camera/webcam prediction with live view"""
+def standardize_image_size(image, target_width, target_height, keep_aspect_ratio=True):
+    """
+    Resize image to standard size
+
+    Args:
+        image: Input image (numpy array)
+        target_width: Target width in pixels
+        target_height: Target height in pixels
+        keep_aspect_ratio: If True, pad image to maintain aspect ratio
+
+    Returns:
+        Resized image
+    """
+    h, w = image.shape[:2]
+
+    if not keep_aspect_ratio:
+        # Simple resize, may distort image
+        return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+
+    # Calculate scaling to fit within target dimensions
+    scale = min(target_width / w, target_height / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    # Resize image
+    resized = cv2.resize(image, (new_w, new_h),
+                         interpolation=cv2.INTER_LANCZOS4)
+
+    # Create canvas with target size (black background)
+    canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+
+    # Calculate position to center the image
+    x_offset = (target_width - new_w) // 2
+    y_offset = (target_height - new_h) // 2
+
+    # Place resized image on canvas
+    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+
+    return canvas
+
+
+def load_and_standardize_image(image_path, target_width, target_height, keep_aspect_ratio=True):
+    """Load image and standardize its size"""
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Failed to load image: {image_path}")
+
+    return standardize_image_size(image, target_width, target_height, keep_aspect_ratio)
+
+
+def draw_text_overlay(image, text, corrections=None, quality_score=None):
+    """Draw converted text with quality indicators on image"""
+    if not text:
+        return image
+
+    img_height, img_width = image.shape[:2]
+    max_width = img_width - 40
+
+    overlay = image.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    thickness = 2
+    line_height = 30
+
+    # Split text into lines that fit
+    words = text.split()
+    lines = []
+    current_line = []
+
+    for word in words:
+        test_line = ' '.join(current_line + [word])
+        (text_width, _), _ = cv2.getTextSize(
+            test_line, font, font_scale, thickness)
+
+        if text_width <= max_width:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(' '.join(current_line))
+            current_line = [word]
+
+    if current_line:
+        lines.append(' '.join(current_line))
+
+    # Add correction info line
+    info_lines = []
+    if corrections and len(corrections) > 0:
+        info_lines.append(f"Corrections: {len(corrections)}")
+    if quality_score is not None:
+        color_indicator = "🟢" if quality_score > 0.8 else "🟡" if quality_score > 0.6 else "🔴"
+        info_lines.append(f"Quality: {quality_score:.2f} {color_indicator}")
+
+    # Draw background
+    total_lines = len(lines) + len(info_lines)
+    overlay_height = total_lines * line_height + 20
+    cv2.rectangle(overlay, (10, img_height - overlay_height - 10),
+                  (img_width - 10, img_height - 10), (0, 0, 0), -1)
+
+    # Blend overlay
+    alpha = 0.7
+    image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+
+    # Draw text
+    y_position = img_height - overlay_height + 10
+
+    # Draw info lines first
+    for info_line in info_lines:
+        cv2.putText(image, info_line, (20, y_position), font, 0.5,
+                    (255, 255, 0), thickness)
+        y_position += 25
+
+    # Draw text lines
+    for line in lines:
+        cv2.putText(image, line, (20, y_position), font, font_scale,
+                    (0, 255, 0), thickness)
+        y_position += line_height
+
+    return image
+
+
+def predict_camera(detector, camera_idx, args, converter):
+    """Handle camera/webcam prediction with live Braille to text"""
     logger = get_logger("prediction")
 
     logger.info("\n" + "="*60)
-    logger.info("CAMERA MODE - LIVE VIEW")
+    logger.info("ROBUST BRAILLE CAMERA MODE")
     logger.info("="*60)
     logger.info(f"Camera index: {camera_idx}")
+    logger.info(f"Spell checking: {'ON' if args.enable_spellcheck else 'OFF'}")
+    logger.info(
+        f"Gap detection: {'ON' if args.enable_gap_detection else 'OFF'}")
     logger.info(
         "Controls: 'q'=Quit, 's'=Save, '+'=More confident, '-'=Less confident")
     logger.info("="*60)
@@ -137,18 +300,27 @@ def predict_camera(detector, camera_idx, args, class_names):
             # Get annotated frame
             if results and len(results) > 0:
                 annotated_frame = results[0].plot()
-                num_detections = len(results[0].boxes)
 
-                if num_detections > 0:
-                    classes = results[0].boxes.cls.cpu().numpy()
-                    y_offset = 30
-                    for cls_idx in range(len(class_names)):
-                        count = (classes == cls_idx).sum()
-                        if count > 0:
-                            text = f"{class_names[cls_idx]}: {count}"
-                            cv2.putText(annotated_frame, text, (10, y_offset),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            y_offset += 25
+                # Convert to text with metadata
+                metadata = converter.convert_results_to_text(
+                    results, return_metadata=True)
+                converted_text = metadata['text']
+                corrections = metadata['corrections']
+                quality = metadata.get('average_confidence', 0.0)
+
+                # Show text on frame
+                if args.show_text and converted_text:
+                    annotated_frame = draw_text_overlay(
+                        annotated_frame,
+                        converted_text,
+                        corrections,
+                        quality
+                    )
+
+                # Show detection count
+                num_detections = len(results[0].boxes)
+                cv2.putText(annotated_frame, f"Detections: {num_detections}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             else:
                 annotated_frame = frame
 
@@ -166,7 +338,7 @@ def predict_camera(detector, camera_idx, args, class_names):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             # Display live
-            cv2.imshow('Nail Detection - Live Camera', annotated_frame)
+            cv2.imshow('Robust Braille Detection', annotated_frame)
 
             # Handle keyboard
             key = cv2.waitKey(1) & 0xFF
@@ -175,9 +347,23 @@ def predict_camera(detector, camera_idx, args, class_names):
                 break
             elif key == ord('s'):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"camera_capture_{timestamp}.jpg"
-                cv2.imwrite(filename, annotated_frame)
-                logger.info(f"📸 Saved: {filename}")
+                img_filename = f"braille_capture_{timestamp}.jpg"
+                txt_filename = f"braille_text_{timestamp}.txt"
+
+                cv2.imwrite(img_filename, annotated_frame)
+                logger.info(f"📸 Saved image: {img_filename}")
+
+                if converted_text:
+                    with open(txt_filename, 'w', encoding='utf-8') as f:
+                        f.write(converted_text)
+                        if corrections:
+                            f.write("\n\n--- Corrections Made ---\n")
+                            for corr in corrections:
+                                f.write(
+                                    f"{corr.original} → {corr.corrected}\n")
+                    logger.info(f"📝 Saved text: {txt_filename}")
+                    logger.info(f"Text: {converted_text}")
+
             elif key == ord('+') or key == ord('='):
                 conf_threshold = min(0.95, conf_threshold + 0.05)
                 logger.info(f"Confidence: {conf_threshold:.2f}")
@@ -203,34 +389,49 @@ def main():
 
     if args.name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.name = f"predict_{timestamp}"
+        args.name = f"prediction_{timestamp}"
 
     logger.info("="*60)
-    logger.info("Starting Prediction")
+    logger.info("Starting Robust Braille Prediction")
     logger.info("="*60)
     logger.info(f"Weights: {args.weights}")
     logger.info(f"Source: {args.source}")
     logger.info(f"Confidence: {args.conf}")
+    logger.info(
+        f"Spell checking: {'Enabled' if args.enable_spellcheck else 'Disabled'}")
+    logger.info(
+        f"Gap detection: {'Enabled' if args.enable_gap_detection else 'Disabled'}")
 
     weights_path = Path(args.weights)
     if not weights_path.exists():
         logger.error(f"Weights file not found: {args.weights}")
         sys.exit(1)
 
+    # Initialize detector
     detector = YOLODetector(model_name=str(weights_path),
                             device=args.device, verbose=args.verbose)
     logger.info(f"Using device: {detector.device}")
 
-    class_names = []
-    if Path(args.data).exists():
-        with open(args.data, 'r') as f:
-            data_config = yaml.safe_load(f)
-            class_names = data_config.get('names', [])
+    # Initialize Robust Braille converter
+    converter = RobustBrailleConverter(
+        line_height_threshold=args.line_height,
+        word_gap_threshold=args.word_gap,
+        char_gap_threshold=args.char_gap,
+        min_confidence=args.min_confidence,
+        enable_spellcheck=args.enable_spellcheck,
+        enable_gap_detection=args.enable_gap_detection,
+        bilingual=True
+    )
+    logger.info(f"Robust converter initialized")
+    logger.info(f"  Line height threshold: {args.line_height}px")
+    logger.info(f"  Word gap threshold: {args.word_gap}px")
+    logger.info(f"  Character gap threshold: {args.char_gap}px")
+    logger.info(f"  Min confidence: {args.min_confidence}")
 
     # Check if camera
     if is_camera_source(args.source):
         camera_idx = int(args.source)
-        predict_camera(detector, camera_idx, args, class_names)
+        predict_camera(detector, camera_idx, args, converter)
         return
 
     # Handle files/directories
@@ -238,6 +439,77 @@ def main():
     if not source_path.exists():
         logger.error(f"Source not found: {args.source}")
         sys.exit(1)
+
+    # Prepare source for prediction
+    prediction_source = args.source
+    temp_files = []  # Track temporary standardized images
+
+    # If standardizing size and source is a file or directory
+    if args.standardize_size and source_path.is_file():
+        logger.info(f"\n📏 Standardizing image size...")
+        try:
+            standardized = load_and_standardize_image(
+                source_path,
+                args.output_width,
+                args.output_height,
+                args.keep_aspect_ratio
+            )
+
+            # Save standardized image temporarily
+            temp_path = source_path.parent / \
+                f"{source_path.name}"
+            cv2.imwrite(str(temp_path), standardized)
+            temp_files.append(temp_path)
+            prediction_source = str(temp_path)
+
+            logger.info(
+                f"✓ Image standardized to {args.output_width}x{args.output_height}")
+            logger.info(
+                f"  Original size: {cv2.imread(str(source_path)).shape[:2]}")
+            logger.info(f"  New size: {standardized.shape[:2]}")
+
+        except Exception as e:
+            logger.error(f"Failed to standardize image: {e}")
+            logger.info("Continuing with original image...")
+
+    elif args.standardize_size and source_path.is_dir():
+        logger.info(f"\n📏 Standardizing all images in directory...")
+
+        # Create temporary directory for standardized images
+        temp_dir = source_path.parent / f"{source_path.name}"
+        temp_dir.mkdir(exist_ok=True)
+
+        # Process all images in directory
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+        image_files = [f for f in source_path.iterdir()
+                       if f.suffix.lower() in image_extensions]
+
+        logger.info(f"Found {len(image_files)} images to standardize...")
+
+        for img_file in image_files:
+            try:
+                standardized = load_and_standardize_image(
+                    img_file,
+                    args.output_width,
+                    args.output_height,
+                    args.keep_aspect_ratio
+                )
+
+                # Save to temp directory
+                temp_path = temp_dir / img_file.name
+                cv2.imwrite(str(temp_path), standardized)
+                temp_files.append(temp_path)
+
+            except Exception as e:
+                logger.warning(f"Failed to standardize {img_file.name}: {e}")
+
+        if temp_files:
+            prediction_source = str(temp_dir)
+            logger.info(
+                f"✓ Standardized {len(temp_files)} images to {args.output_width}x{args.output_height}")
+        else:
+            logger.warning(
+                "No images were standardized, using original directory")
 
     predict_config = ModelConfig.get_prediction_config(
         imgsz=args.imgsz, conf=args.conf, iou=args.iou, max_det=args.max_det,
@@ -249,39 +521,154 @@ def main():
 
     try:
         results = detector.predict(
-            source=args.source, project=args.project, name=args.name, **predict_config)
+            source=prediction_source, project=args.project, name=args.name, **predict_config)
 
-        total_detections = 0
+        logger.info("\n" + "="*60)
+        logger.info("RESULTS WITH ERROR CORRECTION")
+        logger.info("="*60)
+
+        all_reports = []
+
         for i, result in enumerate(results):
-            num_detections = len(result.boxes)
-            total_detections += num_detections
+            # Get comprehensive report
+            report = converter.get_detection_report([result])
+            all_reports.append(report)
 
-            if num_detections > 0:
-                logger.info(f"\nImage {i+1}: {num_detections} detections")
-                classes = result.boxes.cls.cpu().numpy()
-                for cls_idx in range(len(class_names)):
-                    count = (classes == cls_idx).sum()
-                    if count > 0:
-                        logger.info(f"  {class_names[cls_idx]}: {count}")
+            logger.info(f"\n📄 Image {i+1}:")
+            logger.info(f"  Total Detections: {report['total_detections']}")
+            logger.info(f"  Lines: {report['num_lines']}")
+            logger.info(
+                f"  Average Confidence: {report['average_confidence']:.2f}")
+            logger.info(f"  Quality Score: {report['quality_score']:.2f}")
 
+            if report['corrections_made'] > 0:
+                logger.info(
+                    f"\n  🔧 Corrections Made: {report['corrections_made']}")
+                for corr in report['corrections']:
+                    logger.info(
+                        f"    '{corr['original']}' → '{corr['corrected']}' ({corr['method']})")
+
+            if report['low_confidence_words']:
+                logger.info(f"\n  ⚠️  Low Confidence Words:")
+                for lc in report['low_confidence_words'][:5]:  # Show first 5
+                    logger.info(
+                        f"    '{lc['word']}' (conf: {lc['confidence']:.2f})")
+
+            logger.info(f"\n  📝 Final Text:")
+            logger.info(f"  {'-'*50}")
+            for line in report['final_text'].split('\n'):
+                logger.info(f"  {line}")
+            logger.info(f"  {'-'*50}")
+
+            if report['raw_text'] != report['final_text']:
+                logger.info(f"\n  📝 Raw Text (before corrections):")
+                logger.info(f"  {'-'*50}")
+                for line in report['raw_text'].split('\n'):
+                    logger.info(f"  {line}")
+                logger.info(f"  {'-'*50}")
+
+            # Save text files
+            save_dir = Path(args.project) / args.name
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            if hasattr(result, 'path'):
+                original_name = Path(result.path).stem
+            else:
+                original_name = f"image_{i+1}"
+
+            if args.save_text_file:
+                text_file = save_dir / f"{original_name}_text.txt"
+                with open(text_file, 'w', encoding='utf-8') as f:
+                    f.write(report['final_text'])
+                logger.info(f"  💾 Text saved to: {text_file}")
+
+            if args.save_report:
+                report_file = save_dir / f"{original_name}_report.txt"
+                with open(report_file, 'w', encoding='utf-8') as f:
+                    f.write(f"=== BRAILLE DETECTION REPORT ===\n\n")
+                    f.write(f"Detections: {report['total_detections']}\n")
+                    f.write(f"Lines: {report['num_lines']}\n")
+                    f.write(
+                        f"Avg Confidence: {report['average_confidence']:.2f}\n")
+                    f.write(
+                        f"Quality Score: {report['quality_score']:.2f}\n\n")
+
+                    if report['corrections_made'] > 0:
+                        f.write(
+                            f"Corrections Made: {report['corrections_made']}\n")
+                        for corr in report['corrections']:
+                            f.write(
+                                f"  '{corr['original']}' → '{corr['corrected']}'\n")
+                        f.write("\n")
+
+                    f.write(f"\n=== FINAL TEXT ===\n")
+                    f.write(report['final_text'])
+
+                    if report['raw_text'] != report['final_text']:
+                        f.write(f"\n\n=== RAW TEXT (before corrections) ===\n")
+                        f.write(report['raw_text'])
+
+                logger.info(f"  📊 Report saved to: {report_file}")
+
+            # Show image with text overlay
             if args.view_img and result.orig_img is not None:
-                cv2.imshow(f"Prediction {i+1}", result.plot())
+                display_img = result.plot()
+                if args.show_text:
+                    display_img = draw_text_overlay(
+                        display_img,
+                        report['final_text'],
+                        report['corrections'],
+                        report['quality_score']
+                    )
+                cv2.imshow(f"Robust Braille {i+1}", display_img)
                 cv2.waitKey(0)
 
-        logger.info(f"\nTotal detections: {total_detections}")
-        if len(results) > 0:
-            logger.info(
-                f"Average per image: {total_detections/len(results):.2f}")
-        if args.save and results:
-            logger.info(f"\nResults saved to: {results[0].save_dir}")
+        # Get parameter suggestions
+        if results:
+            logger.info("\n" + "="*60)
+            logger.info("PARAMETER RECOMMENDATIONS")
+            logger.info("="*60)
+            suggestions = converter.suggest_parameter_adjustments(results)
+            for key, msg in suggestions.items():
+                logger.info(f"\n{msg}")
 
-        logger.info("\n✅ Prediction completed!")
+        if args.save and results:
+            logger.info(f"\n📁 Results saved to: {results[0].save_dir}")
+
+        logger.info("\n✅ Robust Braille prediction completed!")
         if args.view_img:
             cv2.destroyAllWindows()
 
     except Exception as e:
         logger.error(f"Prediction failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise
+
+    finally:
+        # Clean up temporary standardized images
+        if temp_files:
+            logger.info(
+                f"\n🧹 Cleaning up {len(temp_files)} temporary files...")
+            for temp_file in temp_files:
+                try:
+                    if temp_file.is_file():
+                        temp_file.unlink()
+                    elif temp_file.is_dir():
+                        import shutil
+                        shutil.rmtree(temp_file)
+                except Exception as e:
+                    logger.warning(f"Failed to delete {temp_file}: {e}")
+
+            # Remove temp directory if it exists and is empty
+            if args.standardize_size and source_path.is_dir():
+                temp_dir = source_path.parent / \
+                    f"{source_path.name}"
+                if temp_dir.exists():
+                    try:
+                        temp_dir.rmdir()
+                    except:
+                        pass
 
 
 if __name__ == "__main__":
