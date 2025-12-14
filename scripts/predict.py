@@ -14,9 +14,14 @@ from config.model_config import ModelConfig
 from utils.logger import get_logger
 import sys
 from pathlib import Path
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
+GROQ_API = os.getenv("GROQ_API")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
@@ -78,11 +83,11 @@ def parse_args():
     # Robust conversion parameters
     parser.add_argument("--line-height", type=int, default=50,
                         help="Max vertical distance for same line (pixels)")
-    parser.add_argument("--word-gap", type=int, default=30,
+    parser.add_argument("--word-gap", type=int, default=80,
                         help="Min horizontal distance for word spacing (pixels)")
-    parser.add_argument("--char-gap", type=int, default=25,
+    parser.add_argument("--char-gap", type=int, default=30,
                         help="Expected spacing between characters (pixels)")
-    parser.add_argument("--min-confidence", type=float, default=0.15,
+    parser.add_argument("--min-confidence", type=float, default=0.10,
                         help="Minimum confidence to trust detection")
     parser.add_argument("--enable-spellcheck", action="store_true", default=True,
                         help="Enable spell checking corrections")
@@ -101,12 +106,21 @@ def parse_args():
     parser.add_argument("--language", type=str, default='en',
                         help="Language for spell checking (en, es, etc.)")
 
+    # LLM correction parameters
+    parser.add_argument("--enable-llm", action="store_true", default=True,
+                        help="Enable LLM-based context correction (requires API key or Ollama)")
+    parser.add_argument("--llm-api", type=str, default='groq',
+                        choices=['groq', 'ollama', 'together', 'huggingface'],
+                        help="Which LLM API to use")
+    parser.add_argument("--llm-key", type=str, default=GROQ_API,
+                        help="API key for LLM service (not needed for ollama)")
+
     # Image standardization parameters
     parser.add_argument("--standardize-size", action="store_true", default=True,
                         help="Resize all images to standard resolution")
-    parser.add_argument("--output-width", type=int, default=1920,
+    parser.add_argument("--output-width", type=int, default=1280,
                         help="Standard output width (if --standardize-size enabled)")
-    parser.add_argument("--output-height", type=int, default=1080,
+    parser.add_argument("--output-height", type=int, default=720,
                         help="Standard output height (if --standardize-size enabled)")
     parser.add_argument("--keep-aspect-ratio", action="store_true", default=True,
                         help="Maintain aspect ratio when resizing")
@@ -389,7 +403,7 @@ def main():
 
     if args.name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.name = f"prediction_{timestamp}"
+        args.name = f"predictions_{timestamp}"
 
     logger.info("="*60)
     logger.info("Starting Robust Braille Prediction")
@@ -420,7 +434,10 @@ def main():
         min_confidence=args.min_confidence,
         enable_spellcheck=args.enable_spellcheck,
         enable_gap_detection=args.enable_gap_detection,
-        bilingual=True
+        bilingual=True,
+        enable_llm_correction=args.enable_llm,
+        llm_api=args.llm_api,
+        llm_api_key=args.llm_key
     )
     logger.info(f"Robust converter initialized")
     logger.info(f"  Line height threshold: {args.line_height}px")
@@ -457,7 +474,7 @@ def main():
 
             # Save standardized image temporarily
             temp_path = source_path.parent / \
-                f"{source_path.name}"
+                f"prediction_{source_path.name}"
             cv2.imwrite(str(temp_path), standardized)
             temp_files.append(temp_path)
             prediction_source = str(temp_path)

@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 *.env
 *.zip
+*/predictions/**/*.txt
+*/predictions/**/*.png
+*/predictions/**/*.jpg
+*.log

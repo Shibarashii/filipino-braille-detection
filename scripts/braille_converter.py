@@ -1,6 +1,7 @@
 """
 Robust Braille to Text Converter with Error Correction
 Supports Filipino (Tagalog) and English with bilingual spell checking
+FIXED VERSION: Proper word spacing for LLM correction
 """
 import numpy as np
 from typing import List, Tuple, Dict, Optional
@@ -197,7 +198,10 @@ class RobustBrailleConverter:
         min_confidence=0.15,
         enable_spellcheck=True,
         enable_gap_detection=True,
-        bilingual=True
+        bilingual=True,
+        enable_llm_correction=False,
+        llm_api='groq',
+        llm_api_key=None
     ):
         """
         Initialize robust converter for Filipino Grade 1 Braille
@@ -228,6 +232,18 @@ class RobustBrailleConverter:
         self.corrections = []  # Track all corrections made
         self.low_confidence_words = []  # Track uncertain words
 
+        # LLM correction
+        self.enable_llm_correction = enable_llm_correction
+        self.llm_corrections = []  # Track LLM corrections
+
+        # Initialize LLM corrector
+        self.llm_corrector = None
+        if enable_llm_correction and LLM_AVAILABLE:
+            self.llm_corrector = LLMTextCorrector(llm_api, llm_api_key)
+            print(f"✓ LLM correction enabled (using {llm_api})")
+        elif enable_llm_correction and not LLM_AVAILABLE:
+            print("⚠️  LLM correction requested but llm module not found")
+
     def convert_results_to_text(
         self,
         results,
@@ -251,6 +267,7 @@ class RobustBrailleConverter:
         # Reset tracking
         self.corrections = []
         self.low_confidence_words = []
+        self.llm_corrections = []
 
         # Extract detections
         detections = self._extract_detections(results[0])
@@ -267,6 +284,7 @@ class RobustBrailleConverter:
 
         # Convert each line to text
         text_lines = []
+        raw_lines = []
         line_confidences = []
 
         for line in lines:
@@ -276,6 +294,8 @@ class RobustBrailleConverter:
             line_conf = line_result['confidence']
 
             if line_text.strip():
+                raw_lines.append(line_text)
+
                 # Apply corrections if enabled
                 if apply_corrections and self.enable_spellcheck:
                     line_text = self._correct_line(line_text, line_conf)
@@ -284,6 +304,7 @@ class RobustBrailleConverter:
                 line_confidences.append(line_conf)
 
         final_text = "\n".join(text_lines)
+        raw_text = "\n".join(raw_lines)
         avg_confidence = np.mean(line_confidences) if line_confidences else 0.0
 
         # Apply LLM correction if enabled (after spell check)
@@ -306,7 +327,7 @@ class RobustBrailleConverter:
         if return_metadata:
             return {
                 "text": final_text,
-                "raw_text": "\n".join([l['text'] for l in [self._convert_line_to_text(line, track_confidence=True) for line in lines]]),
+                "raw_text": raw_text,
                 "corrections": self.corrections,
                 "llm_corrections": self.llm_corrections,
                 "low_confidence_words": self.low_confidence_words,
@@ -408,11 +429,14 @@ class RobustBrailleConverter:
         return lines
 
     def _convert_line_to_text(self, line: List[BrailleDetection], track_confidence=False) -> dict:
-        """Convert a line of Braille detections to text"""
+        """
+        Convert a line of Braille detections to text
+        FIXED: Properly groups characters into words with spaces between words
+        """
         if not line:
             return {"text": "", "confidence": 1.0, "word_confidences": []}
 
-        text = []
+        words = []  # Store complete words
         word_confidences = []
         current_word_chars = []
         current_word_confs = []
@@ -420,11 +444,13 @@ class RobustBrailleConverter:
         i = 0
         capitalize_next = False
         number_mode = False
+        last_x_pos = None
 
         while i < len(line):
             detection = line[i]
             class_name = detection.class_name
             confidence = detection.confidence
+            current_x = detection.center_x
 
             # Handle special indicators
             if class_name == "capital":
@@ -437,10 +463,9 @@ class RobustBrailleConverter:
                 i += 1
                 continue
 
-            # Check for word gaps
-            if i > 0:
-                prev_detection = line[i - 1]
-                gap = detection.center_x - prev_detection.center_x
+            # Check for word gaps BEFORE processing current character
+            if last_x_pos is not None:
+                gap = current_x - last_x_pos
 
                 if gap > self.word_gap_threshold:
                     # End current word
@@ -456,24 +481,24 @@ class RobustBrailleConverter:
                                 "confidence": avg_conf
                             })
 
-                        text.append(word)
+                        words.append(word)
                         word_confidences.append(avg_conf)
                         current_word_chars = []
                         current_word_confs = []
 
-                    text.append(" ")
                     number_mode = False  # Space ends number mode
 
             # Convert character
             char = self._convert_character(
                 class_name, capitalize_next, number_mode)
 
-            if char:
+            if char and char.strip():  # Only add non-empty characters
                 current_word_chars.append(char)
                 current_word_confs.append(confidence)
 
-            # Reset flags
+            # Reset flags and update position
             capitalize_next = False
+            last_x_pos = current_x
 
             i += 1
 
@@ -489,10 +514,11 @@ class RobustBrailleConverter:
                     "confidence": avg_conf
                 })
 
-            text.append(word)
+            words.append(word)
             word_confidences.append(avg_conf)
 
-        final_text = "".join(text)
+        # Join words with spaces (this is the key fix!)
+        final_text = " ".join(words)
         avg_confidence = np.mean(word_confidences) if word_confidences else 1.0
 
         return {
