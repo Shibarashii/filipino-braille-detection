@@ -1,3 +1,4 @@
+# scripts/predict.py
 """
 Robust Braille Prediction Script with Error Correction
 Includes spell checking, gap detection, and intelligent corrections
@@ -89,7 +90,7 @@ def parse_args():
                         help="Expected spacing between characters (pixels)")
     parser.add_argument("--min-confidence", type=float, default=0.10,
                         help="Minimum confidence to trust detection")
-    parser.add_argument("--enable-spellcheck", action="store_true", default=True,
+    parser.add_argument("--enable-spellcheck", action="store_true", default=False,
                         help="Enable spell checking corrections")
     parser.add_argument("--disable-spellcheck", dest="enable_spellcheck",
                         action="store_false")
@@ -114,6 +115,9 @@ def parse_args():
                         help="Which LLM API to use")
     parser.add_argument("--llm-key", type=str, default=GROQ_API,
                         help="API key for LLM service (not needed for ollama)")
+    parser.add_argument("--target-language", type=str, default='en',
+                        choices=['en', 'tl', 'both'],
+                        help="Target language for LLM correction (en=English, tl=Filipino, both=Mixed)")
 
     # Image standardization parameters
     parser.add_argument("--standardize-size", action="store_true", default=True,
@@ -437,7 +441,8 @@ def main():
         bilingual=True,
         enable_llm_correction=args.enable_llm,
         llm_api=args.llm_api,
-        llm_api_key=args.llm_key
+        llm_api_key=args.llm_key,
+        target_language=args.target_language
     )
     logger.info(f"Robust converter initialized")
     logger.info(f"  Line height threshold: {args.line_height}px")
